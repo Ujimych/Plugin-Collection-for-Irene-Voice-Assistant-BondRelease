@@ -101,7 +101,6 @@ class _HomeAssistant:
     # пример ищем фразу "тусклый ночник" в нормализованном подсписке "слабый ночник|ночник слабый|тусклый ночник|ночник тусклый"
     # возвращает полное имя объекта и индекс расположения фразы внутри подсписка
     def get_full_name(self, phrase, structure):
-        print(f'### get_full_name >>> {phrase} in {structure}')
         index = -1
         full_name = ""
 
@@ -242,11 +241,12 @@ class _HomeAssistant:
 
                 # нормальзуем название скриптов
                 for script in self.scripts:
-                    self.scripts[script]['name'] = self.prepare_phrase(self.scripts[script]['name'])
+                    if 'name' in self.scripts[script]:
+                        self.scripts[script]['name'] = self.prepare_phrase(self.scripts[script]['name'])
                 print('')
                 print('---------Список загруженных скриптов---------')
                 for script in self.scripts:
-                    if self.scripts[script]['name']:
+                    if 'name' in self.scripts[script] and self.scripts[script]['name']:
                         print(self.scripts[script]['name'])
                 break
         self.entities = {
