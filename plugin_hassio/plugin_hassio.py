@@ -12,7 +12,7 @@ logger = logging.getLogger(modname)
 def start(core: VACore):
     manifest = {
         'name': 'Плагин для Home Assistant',
-        'version': '0.2',
+        'version': '0.3',
         'require_online': True,
 
         'default_options': {
@@ -25,8 +25,8 @@ def start(core: VACore):
         },
 
         'commands': {
-            'включи': hassio_call('switch_on'),
-            'выключи': hassio_call('switch_off'),
+            'включи|включить|включил|включен': hassio_call('switch_on'),
+            'выключи|выключить|выключил|выключен': hassio_call('switch_off'),
             'хочу|сделай|я буду': hassio_call('script'),
             'перезагрузи устройства|загрузи устройства|перезагрузи хоум|загрузи хоум': hassio_call('reload'),
             'какая': hassio_call('sensor'),
@@ -52,7 +52,7 @@ def hassio_call(method):
     return decorator
 
 class _HomeAssistant:
-    entities: TypedDict('EntitiesNameMap', {'switch': dict[str, str], 'sensor': dict[str, str]})
+    entities: TypedDict('EntitiesNameMap', {'switch': dict[str, str], 'light': dict[str, str], 'sensor': dict[str, str]})
     scripts: dict[str, TypedDict('ScriptDomain', {'name': str, 'description': str, })]
 
     def __new__(cls, *args, **kwargs):
@@ -75,10 +75,10 @@ class _HomeAssistant:
         self.totem = options['totem']
         self.va_core = core
 
-        # используется библиотека pymorphy2 она нормализует слова
+        # используется библиотека pymorphy3 она нормализует слова
         try:
-            import pymorphy2
-            self.morph = pymorphy2.MorphAnalyzer()
+            import pymorphy3
+            self.morph = pymorphy3.MorphAnalyzer()
         except ImportError:
             self.morph = None
 
@@ -96,64 +96,175 @@ class _HomeAssistant:
             import traceback
             traceback.print_exc()
 
+    def get_full_name(self, phrase, structure):
+        index = -1
+        full_name = ""
+
+        for item in structure:
+            name_item = str(item)
+            parts_name = name_item.split("|")
+            if ('|' not in name_item and name_item == phrase ) or ('|' in name_item and phrase in parts_name):
+                full_name = name_item
+                if '|' in name_item:
+                    index = parts_name.index(phrase)
+                break
+
+        return full_name, index
+
+    # Поиск скрипта содержащего ключевую фразу 'включи|включить|...' либо 'выключи|выключить|...'
+    def get_script(self, phrase):
+        for script in self.scripts:
+            name_script = str(self.scripts[script].get('name') or self.scripts[script].get('alias') or '' )
+            parts_name_script = name_script.split('|')
+
+            if phrase in parts_name_script:
+                return script
+
+        return None
+
     def call_script(self, phrase):
         no_script = True
         phrase += self.totem
         phrase = self.prepare_phrase(phrase)
         for script in self.scripts:
-            if str(self.scripts[script]['name']) == phrase:  # ищем скрипт с подходящим именем
+            # Добавлена поддержка alias для скриптов
+            name_script = str(self.scripts[script].get('name') or self.scripts[script].get('alias') or '')
+            parts_name_script = name_script.split("|")
+            if ('|' not in name_script and name_script == phrase ) or ('|' in name_script and phrase in parts_name_script):
                 self.request(f'services/script/{script}', 'POST')
                 script_desc = str(
-                    self.scripts[script]['description'])  # бонус: ищем что ответить пользователю из описания скрипта
-                if 'ttsreply(' in script_desc and ')' in script_desc.split('ttsreply(')[1]:  # обходимся без re :^)
+                    self.scripts[script]['description'])
+                if 'ttsreply(' in script_desc and ')' in script_desc.split('ttsreply(')[1]:
                     self.say_if_va(script_desc.split('ttsreply(')[1].split(')')[0])
-                else:  # если в описании ответа нет, выбираем случайный ответ по умолчанию
+                else:
                     self.default_reply()
                 no_script = False
                 break
         if no_script:
             self.say_if_va('Нет такого сценария')
+            print(f"Нет такого сценария >{phrase}< {self.scripts}")
 
     def call_switch_on(self, phrase):
         phrase += self.totem
         phrase = self.prepare_phrase(phrase)
-        if phrase not in self.entities['switch']:
-            self.say_if_va('Нет такого устройства')
-        if self.request('services/switch/turn_on', 'POST', json={
-            'entity_id': self.entities['switch'][phrase]
-        }) is not None:
-            self.default_reply()
+
+        # Сначала ищем устройство
+        full_name_switch, _ = self.get_full_name(phrase, self.entities['switch'])
+        full_name_light, _ = self.get_full_name(phrase, self.entities['light'])
+
+        if full_name_switch:
+            if self.request('services/switch/turn_on', 'POST', json={
+                'entity_id': self.entities['switch'][full_name_switch]
+            }) is not None:
+                self.default_reply()
+            return
+
+        if full_name_light:
+            if self.request('services/light/turn_on', 'POST', json={
+                'entity_id': self.entities['light'][full_name_light]
+            }) is not None:
+                self.default_reply()
+            return
+
+        # Устройство не найдено.
+        # Ищем скрипт с полной командой.
+        script_phrase = self.prepare_phrase(f'включи {phrase}{self.totem}')
+
+        script = self.get_script(script_phrase)
+
+        if script:
+            self.request(f'services/script/{script}', 'POST')
+
+            script_desc = str(
+                self.scripts[script].get('description', '')
+            )
+
+            if 'ttsreply(' in script_desc and ')' in script_desc.split('ttsreply(')[1]:
+                self.say_if_va(script_desc.split('ttsreply(')[1].split(')')[0])
+            else:
+                self.default_reply()
+
+            return
+
+        self.say_if_va('Нет такого устройства или сценария')
+        print(
+            f'Не найдено устройство или сценарий: '
+            f'устройство >{phrase}<, скрипт >{script_phrase}<'
+        )
 
     def call_switch_off(self, phrase):
         phrase += self.totem
         phrase = self.prepare_phrase(phrase)
-        if phrase not in self.entities['switch']:
-            self.say_if_va('Нет такого устройства')
-        elif self.request('services/switch/turn_off', 'POST', json={
-            'entity_id': self.entities['switch'][phrase]
-        }) is not None:
-            self.default_reply()
+
+        # Сначала ищем устройство
+        full_name_switch, _ = self.get_full_name(phrase, self.entities['switch'])
+        full_name_light, _ = self.get_full_name(phrase, self.entities['light'])
+
+        if full_name_switch:
+            if self.request('services/switch/turn_off', 'POST', json={
+                'entity_id': self.entities['switch'][full_name_switch]
+            }) is not None:
+                self.default_reply()
+            return
+
+        if full_name_light:
+            if self.request('services/light/turn_off', 'POST', json={
+                'entity_id': self.entities['light'][full_name_light]
+            }) is not None:
+                self.default_reply()
+            return
+
+        # Устройство не найдено.
+        # Ищем скрипт с полной командой.
+        script_phrase = self.prepare_phrase(f'выключи {phrase}{self.totem}')
+
+        script = self.get_script(script_phrase)
+
+        if script:
+            self.request(f'services/script/{script}', 'POST')
+
+            script_desc = str(self.scripts[script].get('description', ''))
+
+            if 'ttsreply(' in script_desc and ')' in script_desc.split('ttsreply(')[1]:
+                self.say_if_va(script_desc.split('ttsreply(')[1].split(')')[0])
+            else:
+                self.default_reply()
+
+            return
+
+        self.say_if_va('Нет такого устройства или сценария')
+        print(
+            f'Не найдено устройство или сценарий: '
+            f'устройство >{phrase}<, скрипт >{script_phrase}<'
+        )
 
     def call_sensor(self, phrase):
         phrase += self.totem
         phrase = self.prepare_phrase(phrase)
-        if phrase not in self.entities['sensor']:
-            self.say_if_va('Нет такого устройства')
-            print("Нет такого устройства")
+        full_name_sensor, index_phrase = self.get_full_name(phrase, self.entities['sensor'])
+        if full_name_sensor == "":
+            self.say_if_va('Нет такого сенсора')
+            print(f"Нет такого сенсора >{phrase}< среди {self.entities['sensor']}")
             return None
-        state = self.request(f'states/{self.entities["sensor"][phrase]}')
+        state = self.request(f'states/{self.entities["sensor"][full_name_sensor]}')
         if not state:
             self.say_if_va('Не удалось получить статус устройства')
         state_type = state.get('attributes', {}).get('device_class')
         val = int(float(state["state"]))
         if state_type in ('temperature', 'humidity'):
             sensor_name = state.get("attributes").get("friendly_name", phrase)
-            sensor_name = re.sub(r'[^а-яА-ЯёЁ\s]', '', sensor_name)
+            sensor_name = re.sub(r'[^а-яА-ЯёЁ\s\|]', '', sensor_name)
+            if '|' in sensor_name:
+                parts = sensor_name.split("|")
+                sensor_name = parts[index_phrase]
             self.say_if_va(f'{sensor_name} сейчас {self.num2text(val)}'
                            f' {self.unit_of_measurement(state.get("attributes", {}).get("unit_of_measurement"), val)}')
         elif state_type == 'battery':
             sensor_name = state.get("attributes").get("friendly_name", phrase)
-            sensor_name = re.sub(r'[^а-яА-ЯёЁ\s]', '', sensor_name)
+            sensor_name = re.sub(r'[^а-яА-ЯёЁ\s\|]', '', sensor_name)
+            if '|' in sensor_name:
+                parts = sensor_name.split("|")
+                sensor_name = parts[index_phrase]
             self.say_if_va(
                 f'заряд {sensor_name} сейчас {self.num2text(val)}'
                 f' {self.unit_of_measurement(state.get("attributes", {}).get("unit_of_measurement"), val)}')
@@ -182,21 +293,23 @@ class _HomeAssistant:
 
                 # нормальзуем название скриптов
                 for script in self.scripts:
-                    self.scripts[script]['name'] = self.prepare_phrase(self.scripts[script]['name'])
+                    if 'name' in self.scripts[script]:
+                        self.scripts[script]['name'] = self.prepare_phrase(self.scripts[script]['name'])
                 print('')
                 print('---------Список загруженных скриптов---------')
                 for script in self.scripts:
-                    if self.scripts[script]['name']:
+                    if 'name' in self.scripts[script] and self.scripts[script]['name']:
                         print(self.scripts[script]['name'])
                 break
         self.entities = {
             'switch': {},
+            'light': {},
             'sensor': {},
         }
         # загружаем states
         states = self.request('states')
         for state in states:
-            for entity_type in ['switch', 'sensor']:
+            for entity_type in ['switch', 'light', 'sensor']:
                 if state['entity_id'].startswith(f'{entity_type}.'):
                     if not state.get('attributes', {}).get('friendly_name'):
                         # устройства без имени не добавляем
@@ -223,6 +336,11 @@ class _HomeAssistant:
             for name, id in self.entities["switch"].items():
                 print(f"{name}")
         print('')
+        print('------Список загруженных светильников--------')
+        if self.entities["light"]:
+            for name, id in self.entities["light"].items():
+                print(f"{name}")
+        print('')
         print('---------------------------------------------')
 
     def default_reply(self):
@@ -240,14 +358,23 @@ class _HomeAssistant:
             #изменить, если захотите включить  mystem
             #if self.mystem:
             if self.morph:
-                phrase = re.sub(r'[^а-яА-ЯёЁ\s]', '', phrase)
-                phrase = ' '.join(
-                    self.morph.parse(word.lower())[0].normal_form for word in re.split(r'\W+', phrase) if word.strip())
-                # изменить, если захотите включить  mystem
-                #phrase = ' '.join(lem.strip().lower() for lem in self.mystem.lemmatize(phrase) if lem.strip())
+                phrase = re.sub(r'[^а-яА-ЯёЁ\s\|]', '', phrase)
+                if '|' not in phrase:
+                    phrase = ' '.join(
+                        self.morph.parse(word.lower())[0].normal_form for word in re.split(r'\W+', phrase) if word.strip())
+                    # изменить, если захотите включить  mystem
+                    #phrase = ' '.join(lem.strip().lower() for lem in self.mystem.lemmatize(phrase) if lem.strip())
+                else:
+                    # если объект содержит подсписок, то нормализуем по частям
+                    parts = phrase.split('|')
+                    processed_parts = []
+                    for part in parts:
+                        processed_part = ' '.join(self.morph.parse(word.lower())[0].normal_form for word in re.split(r'\W+', part) if word.strip())
+                        processed_parts.append(processed_part)
+                    phrase = '|'.join(processed_parts)
                 return phrase
             else:
-                phrase = re.sub(r'[^а-яА-ЯёЁ\s]', '', phrase)
+                phrase = re.sub(r'[^а-яА-ЯёЁ\s\|]', '', phrase)
                 phrase = phrase.strip().lower()
                 return phrase
 
